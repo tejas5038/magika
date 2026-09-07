@@ -68,10 +68,12 @@ jobs:
         run: |
           set -euo pipefail
           branch=$(jq -r '.branch_name' /tmp/task.json)
+          branch_strategy=$(jq -r '.branch_strategy' /tmp/task.json)
           base_ref=$(jq -r '.base_ref' /tmp/task.json)
           upstream_repo=$(jq -r '.upstream_repo' /tmp/task.json)
           commit_message=$(jq -r '.commit_message' /tmp/task.json)
           test_mode=$(jq -r '.test_mode' /tmp/task.json)
+          repair_action=$(jq -r '.repair_action // ""' /tmp/task.json)
 
           git config user.name 'oss-agent-worker'
           git config user.email 'oss-agent-worker@users.noreply.github.com'
@@ -79,7 +81,13 @@ jobs:
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/${upstream_repo}.git"
           git fetch upstream "$base_ref"
-          git switch -C "$branch" "upstream/$base_ref"
+
+          if [ "$branch_strategy" = 'existing' ]; then
+            git fetch origin "$branch"
+            git switch -C "$branch" "origin/$branch"
+          else
+            git switch -C "$branch" "upstream/$base_ref"
+          fi
 
           count=$(jq '.files | length' /tmp/task.json)
           for ((i=0; i<count; i++)); do
@@ -116,6 +124,13 @@ jobs:
           PY
           done
 
+          if [ "$repair_action" = 'magika_sync' ]; then
+            (cd rust && ./sync.sh)
+          elif [ -n "$repair_action" ]; then
+            echo "Unsupported repair action: $repair_action" >&2
+            exit 4
+          fi
+
           git diff --check
           if [ -z "$(git status --porcelain)" ]; then
             echo 'No changes produced' >&2
@@ -125,6 +140,8 @@ jobs:
           if [ "$test_mode" = 'magika_basic' ]; then
             python3 -m pip install --disable-pip-version-check uv
             UV_FROZEN=1 uv run --project python python/scripts/run_quick_test_magika_module.py
+          elif [ "$test_mode" = 'magika_rust' ]; then
+            (cd rust && ./test.sh)
           elif [ "$test_mode" = 'bazel_build' ]; then
             test_target=$(jq -r '.test_target' /tmp/task.json)
             bazel build "$test_target"
