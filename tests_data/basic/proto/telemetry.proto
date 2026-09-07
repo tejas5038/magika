@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package telemetry.v1;
+
+option go_package = "example.com/telemetry/gen;telemetryv1";
+
+message MetricPoint {
+  string name = 1;
+  double value = 2;
+  int64 timestamp_ms = 3;
+  map<string, string> labels = 4;
+}
+
+message PublishRequest {
+  repeated MetricPoint points = 1;
+}
+
+message PublishResponse {
+  uint32 accepted = 1;
+}
+
+service TelemetryService {
+  rpc Publish(PublishRequest) returns (PublishResponse);
+}
