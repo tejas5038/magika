@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/oss-agent-worker.yml'
   schedule:
-    - cron: '29 * * * *'
+    - cron: '*/10 * * * *'
 
 permissions:
   contents: write
