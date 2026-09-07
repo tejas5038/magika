@@ -1,0 +1,177 @@
+name: OSS Agent Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '29 * * * *'
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: oss-agent-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get GitHub OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
+          token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
+          token=$(printf '%s' "$token_json" | jq -r '.value')
+          test -n "$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch next queued task
+        id: task
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          response=$(curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"action":"next_task"}' \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker')
+          printf '%s' "$response" > /tmp/task-response.json
+          task_id=$(jq -r '.task.id // empty' /tmp/task-response.json)
+          if [ -z "$task_id" ]; then
+            echo 'has_task=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'has_task=true' >> "$GITHUB_OUTPUT"
+          echo "task_id=$task_id" >> "$GITHUB_OUTPUT"
+          jq -c '.task' /tmp/task-response.json > /tmp/task.json
+
+      - name: Checkout repository
+        if: steps.task.outputs.has_task == 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply constrained task
+        if: steps.task.outputs.has_task == 'true'
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=$(jq -r '.branch_name' /tmp/task.json)
+          base_ref=$(jq -r '.base_ref' /tmp/task.json)
+          commit_message=$(jq -r '.commit_message' /tmp/task.json)
+          test_mode=$(jq -r '.test_mode' /tmp/task.json)
+
+          git config user.name 'oss-agent-worker'
+          git config user.email 'oss-agent-worker@users.noreply.github.com'
+
+          git fetch origin "$base_ref"
+          git switch -C "$branch" "origin/$base_ref"
+
+          count=$(jq '.files | length' /tmp/task.json)
+          for ((i=0; i<count; i++)); do
+            path=$(jq -r ".files[$i].path" /tmp/task.json)
+            if [[ "$path" = /* || "$path" == *..* ]]; then
+              echo "Unsafe path: $path" >&2
+              exit 2
+            fi
+            mkdir -p "$(dirname "$path")"
+            jq -r ".files[$i].content" /tmp/task.json > "$path"
+          done
+
+          edit_count=$(jq '.edits | length' /tmp/task.json)
+          for ((i=0; i<edit_count; i++)); do
+            path=$(jq -r ".edits[$i].path" /tmp/task.json)
+            if [[ "$path" = /* || "$path" == *..* ]]; then
+              echo "Unsafe path: $path" >&2
+              exit 2
+            fi
+            jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json
+            python3 - "$path" /tmp/edit.json <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+edit = json.load(open(sys.argv[2], encoding='utf-8'))
+text = path.read_text(encoding='utf-8')
+old = edit['old']
+new = edit['new']
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f'exact edit expected 1 match in {path}, found {count}')
+path.write_text(text.replace(old, new, 1), encoding='utf-8')
+PY
+          done
+
+          git diff --check
+          if [ -z "$(git status --porcelain)" ]; then
+            echo 'No changes produced' >&2
+            exit 3
+          fi
+
+          if [ "$test_mode" = 'magika_basic' ]; then
+            python3 -m pip install --disable-pip-version-check uv
+            UV_FROZEN=1 uv run --project python python/scripts/run_quick_test_magika_module.py
+          elif [ "$test_mode" = 'bazel_build' ]; then
+            test_target=$(jq -r '.test_target' /tmp/task.json)
+            bazel build "$test_target"
+          fi
+
+          git add --all
+          git commit -m "$commit_message"
+          git push --force-with-lease origin "$branch"
+
+          sha=$(git rev-parse HEAD)
+          compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${base_ref}...${branch}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
+
+      - name: Report success
+        if: steps.task.outputs.has_task == 'true' && success()
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+          SHA: ${{ steps.apply.outputs.sha }}
+          BRANCH: ${{ steps.apply.outputs.branch }}
+          COMPARE_URL: ${{ steps.apply.outputs.compare_url }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --argjson task_id "$TASK_ID" \
+            --arg sha "$SHA" \
+            --arg branch "$BRANCH" \
+            --arg compare_url "$COMPARE_URL" \
+            '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,compare_url:$compare_url}}' \
+            > /tmp/report.json
+          curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/report.json \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
+
+      - name: Report failure
+        if: steps.task.outputs.has_task == 'true' && failure()
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --argjson task_id "$TASK_ID" \
+            '{action:"report",status:"failed",task_id:$task_id,error:"GitHub Actions worker failed. Inspect workflow logs for details."}' \
+            > /tmp/report-failure.json
+          curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/report-failure.json \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' || true
