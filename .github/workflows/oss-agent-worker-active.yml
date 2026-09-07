@@ -1,0 +1,104 @@
+name: OSS Agent Worker Active
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: oss-agent-worker-active
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get Supabase OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
+          token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
+          echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
+      - name: Fetch task
+        id: task
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker > /tmp/response.json
+          id=$(jq -r '.task.id // empty' /tmp/response.json)
+          if [ -z "$id" ]; then echo 'has_task=false' >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo 'has_task=true' >> "$GITHUB_OUTPUT"
+          echo "task_id=$id" >> "$GITHUB_OUTPUT"
+          jq -c '.task' /tmp/response.json > /tmp/task.json
+      - name: Checkout
+        if: steps.task.outputs.has_task == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Execute task
+        if: steps.task.outputs.has_task == 'true'
+        id: exec
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=$(jq -r '.branch_name' /tmp/task.json)
+          base=$(jq -r '.base_ref' /tmp/task.json)
+          upstream=$(jq -r '.upstream_repo' /tmp/task.json)
+          git config user.name oss-agent-worker
+          git config user.email oss-agent-worker@users.noreply.github.com
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${upstream}.git"
+          git fetch upstream "$base"
+          git switch -C "$branch" "upstream/$base"
+          n=$(jq '.files|length' /tmp/task.json)
+          for ((i=0;i<n;i++)); do p=$(jq -r ".files[$i].path" /tmp/task.json); mkdir -p "$(dirname "$p")"; jq -r ".files[$i].content" /tmp/task.json > "$p"; done
+          n=$(jq '.edits|length' /tmp/task.json)
+          for ((i=0;i<n;i++)); do jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json; p=$(jq -r '.path' /tmp/edit.json); python3 -c 'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); e=json.load(open(sys.argv[2])); s=p.read_text(); c=s.count(e["old"]); assert c==1, f"exact edit match count != 1 ({c})"; p.write_text(s.replace(e["old"],e["new"],1))' "$p" /tmp/edit.json; done
+          git diff --check
+          mode=$(jq -r '.test_mode' /tmp/task.json)
+          if [ "$mode" = go_test ]; then target=$(jq -r '.test_target // ""' /tmp/task.json); if [ -n "$target" ]; then go test "$target"; else go test ./...; fi; fi
+          git add -A
+          git commit -m "$(jq -r '.commit_message' /tmp/task.json)"
+          git push --force-with-lease origin "$branch"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Get fresh report OIDC token
+        if: steps.task.outputs.has_task == 'true' && always()
+        id: report_oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
+          token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
+          echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
+      - name: Report success
+        if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'success'
+        env:
+          OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n --argjson task_id '${{ steps.task.outputs.task_id }}' --arg sha '${{ steps.exec.outputs.sha }}' --arg branch '${{ steps.exec.outputs.branch }}' '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch}}' > /tmp/report.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker
+      - name: Report failure
+        if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'failure'
+        env:
+          OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n --argjson task_id '${{ steps.task.outputs.task_id }}' '{action:"report",status:"failed",task_id:$task_id,error:"GitHub Actions worker failed; inspect workflow logs."}' > /tmp/report.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker || true
