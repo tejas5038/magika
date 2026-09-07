@@ -2,6 +2,9 @@ name: OSS Agent Worker
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/oss-agent-worker.yml'
   schedule:
     - cron: '29 * * * *'
 
