@@ -101,19 +101,19 @@ jobs:
             fi
             jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json
             python3 - "$path" /tmp/edit.json <<'PY'
-import json
-import pathlib
-import sys
-path = pathlib.Path(sys.argv[1])
-edit = json.load(open(sys.argv[2], encoding='utf-8'))
-text = path.read_text(encoding='utf-8')
-old = edit['old']
-new = edit['new']
-count = text.count(old)
-if count != 1:
-    raise SystemExit(f'exact edit expected 1 match in {path}, found {count}')
-path.write_text(text.replace(old, new, 1), encoding='utf-8')
-PY
+          import json
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          edit = json.load(open(sys.argv[2], encoding='utf-8'))
+          text = path.read_text(encoding='utf-8')
+          old = edit['old']
+          new = edit['new']
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'exact edit expected 1 match in {path}, found {count}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
           done
 
           git diff --check
