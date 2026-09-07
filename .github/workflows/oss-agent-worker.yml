@@ -1,4 +1,4 @@
-# remediation worker trigger
+# remediation worker v2
 name: OSS Agent Worker
 
 on:
@@ -75,6 +75,7 @@ jobs:
           commit_message=$(jq -r '.commit_message' /tmp/task.json)
           test_mode=$(jq -r '.test_mode' /tmp/task.json)
           repair_action=$(jq -r '.repair_action // ""' /tmp/task.json)
+          committed_early=false
 
           git config user.name 'oss-agent-worker'
           git config user.email 'oss-agent-worker@users.noreply.github.com'
@@ -138,6 +139,12 @@ jobs:
             exit 3
           fi
 
+          if [ "$repair_action" = 'magika_sync' ]; then
+            git add --all
+            git commit -m "$commit_message"
+            committed_early=true
+          fi
+
           if [ "$test_mode" = 'magika_basic' ]; then
             python3 -m pip install --disable-pip-version-check uv
             UV_FROZEN=1 uv run --project python python/scripts/run_quick_test_magika_module.py
@@ -148,8 +155,15 @@ jobs:
             bazel build "$test_target"
           fi
 
-          git add --all
-          git commit -m "$commit_message"
+          if [ "$committed_early" = 'false' ]; then
+            git add --all
+            git commit -m "$commit_message"
+          elif [ -n "$(git status --porcelain)" ]; then
+            echo 'Tests changed the working tree after repair commit' >&2
+            git status --short
+            exit 5
+          fi
+
           git push --force-with-lease origin "$branch"
 
           sha=$(git rev-parse HEAD)
