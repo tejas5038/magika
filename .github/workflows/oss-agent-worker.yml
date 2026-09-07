@@ -69,14 +69,17 @@ jobs:
           set -euo pipefail
           branch=$(jq -r '.branch_name' /tmp/task.json)
           base_ref=$(jq -r '.base_ref' /tmp/task.json)
+          upstream_repo=$(jq -r '.upstream_repo' /tmp/task.json)
           commit_message=$(jq -r '.commit_message' /tmp/task.json)
           test_mode=$(jq -r '.test_mode' /tmp/task.json)
 
           git config user.name 'oss-agent-worker'
           git config user.email 'oss-agent-worker@users.noreply.github.com'
 
-          git fetch origin "$base_ref"
-          git switch -C "$branch" "origin/$base_ref"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${upstream_repo}.git"
+          git fetch upstream "$base_ref"
+          git switch -C "$branch" "upstream/$base_ref"
 
           count=$(jq '.files | length' /tmp/task.json)
           for ((i=0; i<count; i++)); do
