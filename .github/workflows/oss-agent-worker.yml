@@ -1,4 +1,4 @@
-# remediation worker v2
+# remediation worker v3
 name: OSS Agent Worker
 
 on:
@@ -7,7 +7,7 @@ on:
     paths:
       - '.github/workflows/oss-agent-worker.yml'
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: write
